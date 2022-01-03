@@ -1,8 +1,20 @@
-import { Availability, EventTypeCustomInput, MembershipRole, Prisma } from "@prisma/client";
+import { EventTypeCustomInput, MembershipRole, Prisma, PeriodType } from "@prisma/client";
 import type { NextApiRequest, NextApiResponse } from "next";
 
 import { getSession } from "@lib/auth";
 import prisma from "@lib/prisma";
+import { WorkingHours } from "@lib/types/schedule";
+
+function isPeriodType(keyInput: string): keyInput is PeriodType {
+  return Object.keys(PeriodType).includes(keyInput);
+}
+
+function handlePeriodType(periodType: string): PeriodType | undefined {
+  if (typeof periodType !== "string") return undefined;
+  const passedPeriodType = periodType.toUpperCase();
+  if (!isPeriodType(passedPeriodType)) return undefined;
+  return PeriodType[passedPeriodType];
+}
 
 function handleCustomInputs(customInputs: EventTypeCustomInput[], eventTypeId: number) {
   if (!customInputs || !customInputs?.length) return undefined;
@@ -81,7 +93,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const isAuthorized = (function () {
       if (event.team) {
         return event.team.members
-          .filter((member) => member.role === MembershipRole.OWNER)
+          .filter((member) => member.role === MembershipRole.OWNER || member.role === MembershipRole.ADMIN)
           .map((member) => member.userId)
           .includes(session.user.id);
       }
@@ -99,7 +111,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
   }
 
-  if (req.method == "PATCH" || req.method == "POST") {
+  if (req.method === "PATCH" || req.method === "POST") {
     const data: Prisma.EventTypeCreateInput | Prisma.EventTypeUpdateInput = {
       title: req.body.title,
       slug: req.body.slug.trim(),
@@ -111,14 +123,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       locations: req.body.locations,
       eventName: req.body.eventName,
       customInputs: handleCustomInputs(req.body.customInputs as EventTypeCustomInput[], req.body.id),
-      periodType: req.body.periodType,
+      periodType: handlePeriodType(req.body.periodType),
       periodDays: req.body.periodDays,
       periodStartDate: req.body.periodStartDate,
       periodEndDate: req.body.periodEndDate,
       periodCountCalendarDays: req.body.periodCountCalendarDays,
-      minimumBookingNotice: req.body.minimumBookingNotice
-        ? parseInt(req.body.minimumBookingNotice)
-        : undefined,
+      minimumBookingNotice:
+        req.body.minimumBookingNotice || req.body.minimumBookingNotice === 0
+          ? parseInt(req.body.minimumBookingNotice, 10)
+          : undefined,
+      slotInterval: req.body.slotInterval,
       price: req.body.price,
       currency: req.body.currency,
     };
@@ -160,7 +174,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       if (req.body.availability) {
-        const openingHours = req.body.availability.openingHours || [];
+        const openingHours: WorkingHours[] = req.body.availability.openingHours || [];
         // const overrides = req.body.availability.dateOverrides || [];
 
         const eventTypeId = +req.body.id;
@@ -172,20 +186,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           });
         }
 
-        Promise.all(
-          openingHours.map((schedule: Pick<Availability, "days" | "startTime" | "endTime">) =>
-            prisma.availability.create({
-              data: {
-                eventTypeId: +req.body.id,
-                days: schedule.days,
-                startTime: schedule.startTime,
-                endTime: schedule.endTime,
-              },
-            })
-          )
-        ).catch((error) => {
-          console.log(error);
-        });
+        const availabilityToCreate = openingHours.map((openingHour) => ({
+          startTime: new Date(openingHour.startTime),
+          endTime: new Date(openingHour.endTime),
+          days: openingHour.days,
+        }));
+
+        data.availability = {
+          createMany: {
+            data: availabilityToCreate,
+          },
+        };
       }
 
       const eventType = await prisma.eventType.update({

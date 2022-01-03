@@ -1,4 +1,5 @@
-import { BookingStatus, Prisma } from "@prisma/client";
+import { BookingStatus, MembershipRole, Prisma } from "@prisma/client";
+import _ from "lodash";
 import { z } from "zod";
 
 import { checkPremiumUsername } from "@ee/lib/core/checkPremiumUsername";
@@ -6,6 +7,7 @@ import { checkPremiumUsername } from "@ee/lib/core/checkPremiumUsername";
 import { checkRegularUsername } from "@lib/core/checkRegularUsername";
 import { ALL_INTEGRATIONS } from "@lib/integrations/getIntegrations";
 import slugify from "@lib/slugify";
+import { Schedule } from "@lib/types/schedule";
 
 import getCalendarCredentials from "@server/integrations/getCalendarCredentials";
 import getConnectedCalendars from "@server/integrations/getConnectedCalendars";
@@ -13,6 +15,7 @@ import { TRPCError } from "@trpc/server";
 
 import { createProtectedRouter, createRouter } from "../createRouter";
 import { resizeBase64Image } from "../lib/resizeBase64Image";
+import { viewerTeamsRouter } from "./viewer/teams";
 import { webhookRouter } from "./viewer/webhook";
 
 const checkUsername =
@@ -53,6 +56,8 @@ const loggedInViewerRouter = createProtectedRouter()
         createdDate,
         completedOnboarding,
         twoFactorEnabled,
+        brandColor,
+        plan,
       } = ctx.user;
       const me = {
         id,
@@ -67,6 +72,8 @@ const loggedInViewerRouter = createProtectedRouter()
         createdDate,
         completedOnboarding,
         twoFactorEnabled,
+        brandColor,
+        plan,
       };
       return me;
     },
@@ -84,6 +91,7 @@ const loggedInViewerRouter = createProtectedRouter()
         hidden: true,
         price: true,
         currency: true,
+        position: true,
         users: {
           select: {
             id: true,
@@ -125,6 +133,14 @@ const loggedInViewerRouter = createProtectedRouter()
                   },
                   eventTypes: {
                     select: eventTypeSelect,
+                    orderBy: [
+                      {
+                        position: "desc",
+                      },
+                      {
+                        id: "asc",
+                      },
+                    ],
                   },
                 },
               },
@@ -135,6 +151,14 @@ const loggedInViewerRouter = createProtectedRouter()
               team: null,
             },
             select: eventTypeSelect,
+            orderBy: [
+              {
+                position: "desc",
+              },
+              {
+                id: "asc",
+              },
+            ],
           },
         },
       });
@@ -149,6 +173,14 @@ const loggedInViewerRouter = createProtectedRouter()
           userId: ctx.user.id,
         },
         select: eventTypeSelect,
+        orderBy: [
+          {
+            position: "desc",
+          },
+          {
+            id: "asc",
+          },
+        ],
       });
 
       type EventTypeGroup = {
@@ -183,7 +215,7 @@ const loggedInViewerRouter = createProtectedRouter()
           name: user.name,
           image: user.avatar,
         },
-        eventTypes: mergedEventTypes,
+        eventTypes: _.orderBy(mergedEventTypes, ["position", "id"], ["desc", "asc"]),
         metadata: {
           membershipCount: 1,
           readOnly: false,
@@ -201,7 +233,7 @@ const loggedInViewerRouter = createProtectedRouter()
           },
           metadata: {
             membershipCount: membership.team.members.length,
-            readOnly: membership.role !== "OWNER",
+            readOnly: membership.role === MembershipRole.MEMBER,
           },
           eventTypes: membership.team.eventTypes,
         }))
@@ -210,8 +242,10 @@ const loggedInViewerRouter = createProtectedRouter()
       const canAddEvents = user.plan !== "FREE" || eventTypeGroups[0].eventTypes.length < 1;
 
       return {
-        canAddEvents,
-        user,
+        viewer: {
+          canAddEvents,
+          plan: user.plan,
+        },
         // don't display event teams without event types,
         eventTypeGroups: eventTypeGroups.filter((groupBy) => !!groupBy.eventTypes?.length),
         // so we can show a dropdown when the user has teams
@@ -300,6 +334,7 @@ const loggedInViewerRouter = createProtectedRouter()
           endTime: true,
           eventType: {
             select: {
+              price: true,
               team: {
                 select: {
                   name: true,
@@ -308,6 +343,7 @@ const loggedInViewerRouter = createProtectedRouter()
             },
           },
           status: true,
+          paid: true,
         },
         orderBy,
         take: take + 1,
@@ -345,7 +381,42 @@ const loggedInViewerRouter = createProtectedRouter()
       // get all the connected integrations' calendars (from third party)
       const connectedCalendars = await getConnectedCalendars(calendarCredentials, user.selectedCalendars);
 
-      return connectedCalendars;
+      return {
+        connectedCalendars,
+        destinationCalendar: user.destinationCalendar,
+      };
+    },
+  })
+  .mutation("setUserDestinationCalendar", {
+    input: z.object({
+      integration: z.string(),
+      externalId: z.string(),
+    }),
+    async resolve({ ctx, input }) {
+      const { user } = ctx;
+      const userId = ctx.user.id;
+      const calendarCredentials = getCalendarCredentials(user.credentials, user.id);
+      const connectedCalendars = await getConnectedCalendars(calendarCredentials, user.selectedCalendars);
+      const allCals = connectedCalendars.map((cal) => cal.calendars ?? []).flat();
+
+      if (
+        !allCals.find((cal) => cal.externalId === input.externalId && cal.integration === input.integration)
+      ) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: `Could not find calendar ${input.externalId}` });
+      }
+      await ctx.prisma.destinationCalendar.upsert({
+        where: {
+          userId,
+        },
+        update: {
+          ...input,
+          userId,
+        },
+        create: {
+          ...input,
+          userId,
+        },
+      });
     },
   })
   .query("integrations", {
@@ -383,6 +454,49 @@ const loggedInViewerRouter = createProtectedRouter()
       };
     },
   })
+  .query("availability", {
+    async resolve({ ctx }) {
+      const { prisma, user } = ctx;
+      const availabilityQuery = await prisma.availability.findMany({
+        where: {
+          userId: user.id,
+        },
+      });
+
+      const schedule = availabilityQuery.reduce(
+        (schedule: Schedule, availability) => {
+          availability.days.forEach((day) => {
+            schedule[day].push({
+              start: new Date(
+                Date.UTC(
+                  new Date().getUTCFullYear(),
+                  new Date().getUTCMonth(),
+                  new Date().getUTCDate(),
+                  availability.startTime.getUTCHours(),
+                  availability.startTime.getUTCMinutes()
+                )
+              ),
+              end: new Date(
+                Date.UTC(
+                  new Date().getUTCFullYear(),
+                  new Date().getUTCMonth(),
+                  new Date().getUTCDate(),
+                  availability.endTime.getUTCHours(),
+                  availability.endTime.getUTCMinutes()
+                )
+              ),
+            });
+          });
+          return schedule;
+        },
+        Array.from([...Array(7)]).map(() => [])
+      );
+      return {
+        schedule,
+        timeZone: user.timeZone,
+      };
+    },
+  })
   .mutation("updateProfile", {
     input: z.object({
       username: z.string().optional(),
@@ -392,6 +506,7 @@ const loggedInViewerRouter = createProtectedRouter()
       timeZone: z.string().optional(),
       weekStart: z.string().optional(),
       hideBranding: z.boolean().optional(),
+      brandColor: z.string().optional(),
       theme: z.string().optional().nullable(),
       completedOnboarding: z.boolean().optional(),
       locale: z.string().optional(),
@@ -423,9 +538,102 @@ const loggedInViewerRouter = createProtectedRouter()
         data,
       });
     },
+  })
+  .mutation("eventTypeOrder", {
+    input: z.object({
+      ids: z.array(z.number()),
+    }),
+    async resolve({ input, ctx }) {
+      const { prisma, user } = ctx;
+      const allEventTypes = await ctx.prisma.eventType.findMany({
+        select: {
+          id: true,
+        },
+        where: {
+          id: {
+            in: input.ids,
+          },
+          OR: [
+            {
+              userId: user.id,
+            },
+            {
+              users: {
+                some: {
+                  id: user.id,
+                },
+              },
+            },
+            {
+              team: {
+                members: {
+                  some: {
+                    userId: user.id,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      });
+      const allEventTypeIds = new Set(allEventTypes.map((type) => type.id));
+      if (input.ids.some((id) => !allEventTypeIds.has(id))) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+        });
+      }
+      await Promise.all(
+        _.reverse(input.ids).map((id, position) => {
+          return prisma.eventType.update({
+            where: {
+              id,
+            },
+            data: {
+              position,
+            },
+          });
+        })
+      );
+    },
+  })
+  .mutation("eventTypePosition", {
+    input: z.object({
+      eventType: z.number(),
+      action: z.string(),
+    }),
+    async resolve({ input, ctx }) {
+      // This mutation is for the user to be able to order their event types by incrementing or decrementing the position number
+      const { prisma } = ctx;
+      if (input.eventType && input.action == "increment") {
+        await prisma.eventType.update({
+          where: {
+            id: input.eventType,
+          },
+          data: {
+            position: {
+              increment: 1,
+            },
+          },
+        });
+      }
+
+      if (input.eventType && input.action == "decrement") {
+        await prisma.eventType.update({
+          where: {
+            id: input.eventType,
+          },
+          data: {
+            position: {
+              decrement: 1,
+            },
+          },
+        });
+      }
+    },
   });
 
 export const viewerRouter = createRouter()
   .merge(publicViewerRouter)
   .merge(loggedInViewerRouter)
+  .merge("teams.", viewerTeamsRouter)
   .merge("webhook.", webhookRouter);
